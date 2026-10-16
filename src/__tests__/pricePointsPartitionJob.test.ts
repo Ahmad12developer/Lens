@@ -39,7 +39,25 @@ describe('pricePointsPartitionJob', () => {
     mockDrop.mockReset()
   })
 
-  it('runs maintenance with pre-creation and partition drop retention', async () => {
+  it('runs maintenance with pre-creation only by default (dropExpired = false)', async () => {
+    mockEnsure.mockResolvedValueOnce({
+      created: ['price_points_y2026m10d24'],
+      existing: ['price_points_y2026m10d16'],
+    })
+
+    const result = await runPricePointsMaintenance(30, 7, false)
+
+    expect(mockEnsure).toHaveBeenCalledWith(expect.anything(), {
+      precreateDays: 7,
+      daysBack: 1,
+    })
+    expect(mockDrop).not.toHaveBeenCalled()
+
+    expect(result.created).toEqual(['price_points_y2026m10d24'])
+    expect(result.dropped).toEqual([])
+  })
+
+  it('drops expired partitions when dropExpired is explicitly enabled', async () => {
     mockEnsure.mockResolvedValueOnce({
       created: ['price_points_y2026m10d24'],
       existing: ['price_points_y2026m10d16'],
@@ -49,7 +67,7 @@ describe('pricePointsPartitionJob', () => {
       retained: ['price_points_y2026m10d16'],
     })
 
-    const result = await runPricePointsMaintenance(30, 7)
+    const result = await runPricePointsMaintenance(30, 7, true)
 
     expect(mockEnsure).toHaveBeenCalledWith(expect.anything(), {
       precreateDays: 7,

@@ -20,6 +20,8 @@ export const PRICE_POINTS_PRECREATE_DAYS = process.env.PRICE_POINTS_PRECREATE_DA
   ? parseInt(process.env.PRICE_POINTS_PRECREATE_DAYS, 10)
   : DEFAULT_PRECREATE_DAYS
 
+export const PRICE_POINTS_DROP_EXPIRED = process.env.PRICE_POINTS_DROP_EXPIRED === 'true'
+
 function redisConnection() {
   const url = process.env.REDIS_URL
   if (url) return { url }
@@ -40,21 +42,26 @@ export interface PartitionMaintenanceResult {
 /**
  * Runs partition maintenance for price_points:
  * 1. Automatically creates future daily partitions ahead of need (precreateDays).
- * 2. Drops expired partitions older than the retention threshold using DROP TABLE.
+ * 2. Opt-in drops expired partitions older than the retention threshold using DROP TABLE
+ *    when dropExpired is enabled (defaults to PRICE_POINTS_DROP_EXPIRED, which is false by default).
  */
 export async function runPricePointsMaintenance(
   retentionDays: number = PRICE_POINTS_RETENTION_DAYS,
-  precreateDays: number = PRICE_POINTS_PRECREATE_DAYS
+  precreateDays: number = PRICE_POINTS_PRECREATE_DAYS,
+  dropExpired: boolean = PRICE_POINTS_DROP_EXPIRED
 ): Promise<PartitionMaintenanceResult> {
   const creationRes: PartitionCreationResult = await ensurePricePointsPartitions(pgPool, {
     precreateDays,
     daysBack: 1, // ensure today and yesterday are guaranteed
   })
 
-  const retentionRes: PartitionRetentionResult = await dropExpiredPricePointsPartitions(
-    pgPool,
-    retentionDays
-  )
+  let retentionRes: PartitionRetentionResult = { dropped: [], retained: [] }
+  if (dropExpired) {
+    retentionRes = await dropExpiredPricePointsPartitions(
+      pgPool,
+      retentionDays
+    )
+  }
 
   return {
     created: creationRes.created,

@@ -144,8 +144,9 @@ async function main() {
 
   // ── Price points partition maintenance & retention ────────────────────────
   // price_points is range-partitioned by timestamp. We pre-create future partitions
-  // ahead of need so ingesters never fail on unmapped timestamp ranges, and drop
-  // expired partitions via DROP TABLE to maintain fast zero-bloat retention.
+  // ahead of need so ingesters never fail on unmapped timestamp ranges. Dropping
+  // expired partitions is opt-in via PRICE_POINTS_DROP_EXPIRED=true (default: off)
+  // to safeguard raw historical records until rollups are complete (#231).
   const safeMaintainPartitions = async () => {
     try {
       const result = await runPricePointsMaintenance()

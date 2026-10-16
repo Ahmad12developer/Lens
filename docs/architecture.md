@@ -59,7 +59,7 @@ Lens utilizes two distinct ingestion strategies to maintain up-to-date pricing d
 
 ### 2. Storage Layer
 Data is stored in a PostgreSQL database optimized with declarative range partitioning and time-series indexing.
-*   **`price_points`**: A unified table for all trade events across both SDEX and AMM, range-partitioned by `timestamp` into daily partitions (`price_points_yYYYYmMMdDD`). Automatic background workers pre-create future partitions ahead of need, and retention drops expired partitions using metadata-only `DROP TABLE` operations (eliminating vacuum bloat and WAL overhead). Query execution plans on recent time windows leverage PostgreSQL partition pruning to scan only active partitions and skip all expired history.
+*   **`price_points`**: A unified table for all trade events across both SDEX and AMM, range-partitioned by `timestamp` into daily partitions (`price_points_yYYYYmMMdDD`). Automatic background workers pre-create future partitions ahead of need. Partition retention via metadata-only `DROP TABLE` operations is opt-in (`PRICE_POINTS_DROP_EXPIRED=true`, default: off) to safeguard raw historical records until rollups are completed (#231). Query execution plans on recent time windows leverage PostgreSQL partition pruning to scan only active partitions and skip all historical data.
 *   **`pool_snapshots`**: Stores the reserve state of AMM liquidity pools, which is critical for slippage estimation and constant-product price calculations.
 
 ### 3. Aggregation & Routing (`bestRoute`)
