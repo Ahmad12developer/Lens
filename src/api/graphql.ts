@@ -1,11 +1,15 @@
 import type { FastifyInstance } from 'fastify'
+import { ErrorWithProps } from 'mercurius'
 import { price_requests_total } from '../metrics'
-import mercurius, { withFilter, type MercuriusContext } from 'mercurius'
+import mercurius, { withFilter, defaultErrorFormatter, type MercuriusContext } from 'mercurius'
+import { GraphQLError, type ExecutionResult } from 'graphql'
+import { randomUUID } from 'node:crypto'
 import { getCachedPrice } from '../redis'
 import { getAggregatedPrice } from '../aggregator/vwap'
 import { getBestRoute } from '../aggregator/bestRoute'
 import { pgPool } from '../db'
 import { config, activeNetwork } from '../config'
+import { parseAssetStr } from '../pairsRegistry'
 import { priceEmitter, PRICE_PUBLISHED, type PricePublishedEvent } from '../events'
 import { HISTORY_INTERVAL_SECONDS, MAX_HISTORY_POINTS } from './history'
 
@@ -18,6 +22,42 @@ const WINDOW_SECONDS: Record<string, number> = {
 // listener bridges the ingesters' in-process `priceEmitter` onto this topic;
 // each subscriber then filters it down to the pair they asked for.
 const PRICE_TOPIC = 'PRICE_UPDATED'
+// Error codes that resolvers raise on purpose; their messages are written for
+// the caller and are safe to return as-is. Anything else is treated as an
+// unexpected internal failure and masked.
+const USER_FACING_CODES = new Set(['INVALID_INPUT', 'PAIR_NOT_FOUND', 'UNAUTHORIZED'])
+const INTERNAL_ERROR_MESSAGE = 'Internal server error'
+
+function isUserFacing(err: GraphQLError): boolean {
+  // No originalError means graphql-js itself rejected the document (syntax or
+  // validation), which only describes the caller's own query.
+  const original = err.originalError as
+    | { extensions?: { code?: unknown }; errors?: unknown; statusCode?: unknown }
+    | undefined
+  if (!original) return true
+  // Mercurius wraps document validation failures (and other request-level
+  // 4xx faults) in a Fastify error before they reach the formatter.
+  if (Array.isArray(original.errors)) return true
+  if (typeof original.statusCode === 'number' && original.statusCode < 500) return true
+  const code = original.extensions?.code
+  return typeof code === 'string' && USER_FACING_CODES.has(code)
+}
+
+export function formatGraphQLErrors(execution: ExecutionResult, ctx: MercuriusContext) {
+  const requestId = String(ctx?.reply?.request?.id ?? randomUUID())
+  const log = ctx?.reply?.log ?? ctx?.app?.log
+
+  const errors = (execution.errors ?? []).map(err => {
+    if (isUserFacing(err)) return err
+    log?.error({ err: err.originalError ?? err, requestId, path: err.path }, 'unexpected graphql error')
+    return new GraphQLError(INTERNAL_ERROR_MESSAGE, {
+      path: err.path,
+      extensions: { code: 'INTERNAL_SERVER_ERROR', requestId },
+    })
+  })
+
+  return defaultErrorFormatter({ ...execution, errors }, ctx)
+}
 
 export const schema = `
   type AggregatedPrice {
@@ -74,6 +114,19 @@ export const schema = `
   }
 
   type Query {
+    """
+    Aggregated price for a pair. Three outcomes are kept distinct:
+
+    - Malformed asset input (an asset that is not CODE or CODE:ISSUER) fails
+      with a GraphQL error whose extensions.code is INVALID_INPUT.
+    - A well-formed pair that is not tracked on the active network fails with
+      a GraphQL error whose extensions.code is PAIR_NOT_FOUND.
+    - A tracked pair with no trade data yet is not an error: it resolves to an
+      AggregatedPrice with zeroed figures rather than null or an error.
+
+    The result is only null if the resolver itself cannot produce a payload;
+    clients should branch on extensions.code, not on null.
+    """
     getPrice(assetA: String!, assetB: String!): AggregatedPrice
     getBestRoute(assetA: String!, assetB: String!, amount: Float!): RouteInfo
     """
@@ -127,8 +180,21 @@ const resolvers = {
   Query: {
     async getPrice(_: unknown, { assetA, assetB }: { assetA: string; assetB: string }) {
       price_requests_total.inc()
+      for (const [field, value] of [['assetA', assetA], ['assetB', assetB]] as const) {
+        if (!parseAssetStr(value)) {
+          throw new ErrorWithProps(
+            `Invalid ${field}: expected CODE or CODE:ISSUER, got "${value}"`,
+            { code: 'INVALID_INPUT', field },
+          )
+        }
+      }
       const pair = findPair(assetA, assetB)
-      if (!pair) return null
+      if (!pair) {
+        throw new ErrorWithProps(
+          `Pair ${assetA}/${assetB} is not tracked on ${activeNetwork}`,
+          { code: 'PAIR_NOT_FOUND' },
+        )
+      }
       const pairKey = pair.pairKey
 
       // These queries carry no network argument, so they resolve against the
@@ -186,19 +252,19 @@ const resolvers = {
       if (from !== undefined && from !== null) {
         fromDate = new Date(from)
         if (isNaN(fromDate.getTime())) {
-          throw new Error('from must be a valid ISO 8601 date')
+          throw new ErrorWithProps('from must be a valid ISO 8601 date', { code: 'INVALID_INPUT' })
         }
       }
 
       if (to !== undefined && to !== null) {
         toDate = new Date(to)
         if (isNaN(toDate.getTime())) {
-          throw new Error('to must be a valid ISO 8601 date')
+          throw new ErrorWithProps('to must be a valid ISO 8601 date', { code: 'INVALID_INPUT' })
         }
       }
 
       if (fromDate && toDate && fromDate.getTime() > toDate.getTime()) {
-        throw new Error('from must be before to')
+        throw new ErrorWithProps('from must be before to', { code: 'INVALID_INPUT' })
       }
 
       const intervalSecs = WINDOW_SECONDS[window] ?? HISTORY_INTERVAL_SECONDS[window] ?? 60
@@ -208,8 +274,9 @@ const resolvers = {
         const effectiveFrom = fromDate ?? new Date(effectiveTo.getTime() - 24 * 60 * 60 * 1000)
         const spanSecs = (effectiveTo.getTime() - effectiveFrom.getTime()) / 1000
         if (spanSecs / intervalSecs > MAX_HISTORY_POINTS) {
-          throw new Error(
-            `requested window is too large for interval=${window} (max ${MAX_HISTORY_POINTS} points); narrow the range or use a coarser interval`
+          throw new ErrorWithProps(
+            `requested window is too large for interval=${window} (max ${MAX_HISTORY_POINTS} points); narrow the range or use a coarser interval`,
+            { code: 'INVALID_INPUT' }
           )
         }
       }
@@ -290,6 +357,7 @@ export async function registerGraphQL(app: FastifyInstance) {
     schema,
     resolvers,
     graphiql: true,
+    errorFormatter: formatGraphQLErrors,
     path: '/graphql',
     subscription: {
       // Speak the `graphql-transport-ws` subprotocol (the modern `graphql-ws`
